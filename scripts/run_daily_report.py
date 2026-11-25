@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -50,12 +51,38 @@ from worker.workflows.daily_intel import (
     _upload_state_document,
 )
 
-STATE_LIB = "reinsurance-intel-state"
 STATE_DOCUMENTS = ("open_actions", "regulatory_baseline", "seen_events", "last_run_at")
 
 EMAIL_MODEL = os.environ.get("EMAIL_ANALYST_MODEL", "mistral-medium-latest")
 MARKET_MODEL = os.environ.get("MARKET_ANALYST_MODEL", "mistral-large-latest")
 STRATEGY_MODEL = os.environ.get("STRATEGY_ANALYST_MODEL", "mistral-large-latest")
+
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY_SECONDS = 20.0
+
+
+async def with_retries(factory: Callable[[], Any], what: str) -> Any:
+    """Run an API call, backing off on 429 rate limits."""
+    delay = RETRY_BASE_DELAY_SECONDS
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return await factory()
+        except Exception as error:
+            message = str(error)
+            if "429" not in message and "rate" not in message.lower():
+                raise
+            if attempt == RETRY_ATTEMPTS:
+                print(
+                    f"{what}: still rate limited after {RETRY_ATTEMPTS} attempts. "
+                    "Enable pay-as-you-go billing on your Mistral account to lift free-tier limits."
+                )
+                raise
+            print(
+                f"{what}: rate limited (attempt {attempt}/{RETRY_ATTEMPTS}); waiting {delay:.0f}s"
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    raise RuntimeError(f"{what}: exhausted retries")
 
 
 async def fetch_emails(since_date: str, max_messages: int = 25) -> list[dict[str, Any]]:
@@ -193,43 +220,52 @@ async def run(dry_run: bool) -> int:
 
     email_analysis: EmailAnalysis = (
         (
-            await client.chat.parse_async(
-                EmailAnalysis,
-                model=EMAIL_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{EMAIL_ANALYST_INSTRUCTIONS}\n\n"
-                            f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```\n\n"
-                            f"### Recent emails (since {since.isoformat()})\n```json\n{json.dumps(emails, indent=2)}\n```"
-                        ),
-                    }
-                ],
+            await with_retries(
+                lambda: client.chat.parse_async(
+                    EmailAnalysis,
+                    model=EMAIL_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{EMAIL_ANALYST_INSTRUCTIONS}\n\n"
+                                f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```\n\n"
+                                f"### Recent emails (since {since.isoformat()})\n```json\n{json.dumps(emails, indent=2)}\n```"
+                            ),
+                        }
+                    ],
+                ),
+                what="email analysis",
             )
         )
         .choices[0]
         .message.parsed
     )
 
-    agent = await client.beta.agents.create_async(
-        model=MARKET_MODEL,
-        name=f"reinsurance-market-analyst-{now.strftime('%Y%m%d%H%M%S')}",
-        instructions=MARKET_ANALYST_INSTRUCTIONS,
-        tools=[{"type": "web_search"}],
-        completion_args={"temperature": 0.2},
+    agent = await with_retries(
+        lambda: client.beta.agents.create_async(
+            model=MARKET_MODEL,
+            name=f"reinsurance-market-analyst-{now.strftime('%Y%m%d%H%M%S')}",
+            instructions=MARKET_ANALYST_INSTRUCTIONS,
+            tools=[{"type": "web_search"}],
+            completion_args={"temperature": 0.2},
+        ),
+        what="market agent",
     )
     try:
-        conversation = await client.beta.conversations.start_async(
-            agent_id=agent.id,
-            inputs=(
-                f"Today is {now.date().isoformat()}. Research since {since.date().isoformat()}. "
-                "Coverage countries: Kenya, Tanzania, Mauritius.\n\n"
-                f"### Current regulatory baselines\n```json\n{json.dumps(state.regulatory_baseline, indent=2)}\n```\n\n"
-                "### Already-reported events (do not repeat unless there is new development)\n"
-                f"```json\n{json.dumps(state.seen_events[-40:], indent=2)}\n```"
+        conversation = await with_retries(
+            lambda: client.beta.conversations.start_async(
+                agent_id=agent.id,
+                inputs=(
+                    f"Today is {now.date().isoformat()}. Research since {since.date().isoformat()}. "
+                    "Coverage countries: Kenya, Tanzania, Mauritius.\n\n"
+                    f"### Current regulatory baselines\n```json\n{json.dumps(state.regulatory_baseline, indent=2)}\n```\n\n"
+                    "### Already-reported events (do not repeat unless there is new development)\n"
+                    f"```json\n{json.dumps(state.seen_events[-40:], indent=2)}\n```"
+                ),
+                store=False,
             ),
-            store=False,
+            what="market research",
         )
     finally:
         try:
@@ -240,20 +276,23 @@ async def run(dry_run: bool) -> int:
 
     strategic: StrategicAnalysis = (
         (
-            await client.chat.parse_async(
-                StrategicAnalysis,
-                model=STRATEGY_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{STRATEGIST_INSTRUCTIONS}\n\n"
-                            f"### Email analysis\n```json\n{email_analysis.model_dump_json(indent=2)}\n```\n\n"
-                            f"### Market scan\n```json\n{market_scan.model_dump_json(indent=2)}\n```\n\n"
-                            f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```"
-                        ),
-                    }
-                ],
+            await with_retries(
+                lambda: client.chat.parse_async(
+                    StrategicAnalysis,
+                    model=STRATEGY_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{STRATEGIST_INSTRUCTIONS}\n\n"
+                                f"### Email analysis\n```json\n{email_analysis.model_dump_json(indent=2)}\n```\n\n"
+                                f"### Market scan\n```json\n{market_scan.model_dump_json(indent=2)}\n```\n\n"
+                                f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```"
+                            ),
+                        }
+                    ],
+                ),
+                what="strategic analysis",
             )
         )
         .choices[0]
