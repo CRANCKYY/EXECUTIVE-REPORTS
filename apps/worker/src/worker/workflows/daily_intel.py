@@ -266,14 +266,21 @@ STATE_DOCUMENTS = ("open_actions", "regulatory_baseline", "seen_events", "last_r
 
 
 def _mistral_api_config() -> tuple[str, str]:
-    from env.mistral import env as mistral_env
+    try:
+        from env.mistral import env as mistral_env
+
+        settings_base_url = mistral_env.mistral_base_url
+        settings_api_key = mistral_env.mistral_api_key
+    except ImportError:
+        settings_base_url = None
+        settings_api_key = None
 
     base_url = (
-        mistral_env.mistral_base_url
+        settings_base_url
         or os.environ.get("MISTRAL_BASE_URL")
         or "https://api.mistral.ai"
     ).rstrip("/")
-    api_key = mistral_env.mistral_api_key or os.environ.get("MISTRAL_API_KEY", "")
+    api_key = settings_api_key or os.environ.get("MISTRAL_API_KEY", "")
     if not api_key:
         raise ValueError("No Mistral API key available for state storage.")
     return base_url, api_key

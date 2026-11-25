@@ -1,0 +1,23 @@
+name: Keep scheduled workflows active
+
+on:
+  schedule:
+    # Weekly heartbeat so GitHub does not auto-disable the daily report schedule
+    # (schedules are disabled after 60 days of repository inactivity).
+    - cron: "0 2 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit to keep the repository active
+        run: |
+          git config user.name "keepalive-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive (keep GitHub Actions schedules active)"
+          git push
