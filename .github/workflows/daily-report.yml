@@ -10,6 +10,10 @@ on:
         description: "Analyse and persist state, but do not send the email"
         type: boolean
         default: true
+      sample:
+        description: "Free test: send a sample report (no AI calls, nothing saved)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,6 +47,9 @@ jobs:
           ARGS=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS="--dry-run"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.sample }}" = "true" ]; then
+            ARGS="--sample"
           fi
           python scripts/run_daily_report.py $ARGS
 

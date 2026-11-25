@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -50,12 +51,38 @@ from worker.workflows.daily_intel import (
     _upload_state_document,
 )
 
-STATE_LIB = "reinsurance-intel-state"
 STATE_DOCUMENTS = ("open_actions", "regulatory_baseline", "seen_events", "last_run_at")
 
 EMAIL_MODEL = os.environ.get("EMAIL_ANALYST_MODEL", "mistral-medium-latest")
 MARKET_MODEL = os.environ.get("MARKET_ANALYST_MODEL", "mistral-large-latest")
 STRATEGY_MODEL = os.environ.get("STRATEGY_ANALYST_MODEL", "mistral-large-latest")
+
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY_SECONDS = 20.0
+
+
+async def with_retries(factory: Callable[[], Any], what: str) -> Any:
+    """Run an API call, backing off on 429 rate limits."""
+    delay = RETRY_BASE_DELAY_SECONDS
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return await factory()
+        except Exception as error:
+            message = str(error)
+            if "429" not in message and "rate" not in message.lower():
+                raise
+            if attempt == RETRY_ATTEMPTS:
+                print(
+                    f"{what}: still rate limited after {RETRY_ATTEMPTS} attempts. "
+                    "Enable pay-as-you-go billing on your Mistral account to lift free-tier limits."
+                )
+                raise
+            print(
+                f"{what}: rate limited (attempt {attempt}/{RETRY_ATTEMPTS}); waiting {delay:.0f}s"
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    raise RuntimeError(f"{what}: exhausted retries")
 
 
 async def fetch_emails(since_date: str, max_messages: int = 25) -> list[dict[str, Any]]:
@@ -167,11 +194,157 @@ async def send_email(subject: str, body_text: str) -> bool:
     return True
 
 
-async def run(dry_run: bool) -> int:
+SAMPLE_MARKET_SCAN = {
+    "kenya": {
+        "updates": [
+            {
+                "country": "Kenya",
+                "title": "SAMPLE - Nairobi property treaty renews flat",
+                "date": "2026-11-25",
+                "summary": "Sample data: industrial property treaty renews flat with slightly improved capacity.",
+                "source_url": "https://example.com/sample",
+            }
+        ],
+        "regulatory_changes": [],
+        "baseline_current": "Sample baseline - unchanged.",
+    },
+    "tanzania": {
+        "updates": [],
+        "regulatory_changes": [],
+        "baseline_current": "Sample baseline - unchanged.",
+    },
+    "mauritius": {
+        "updates": [],
+        "regulatory_changes": [
+            {
+                "country": "Mauritius",
+                "what_changed": "SAMPLE - minimum capital requirement amendment announced",
+                "previous_state": "Previous: MUR 35m",
+                "new_state": "New: MUR 50m",
+                "source_url": "https://example.com/sample",
+                "confidence": "confirmed",
+            }
+        ],
+        "baseline_current": "Sample baseline - changed.",
+    },
+}
+
+SAMPLE_EMAIL_ANALYSIS = {
+    "new_actions": [
+        {
+            "action": "SAMPLE - Confirm reinsurance renewal budget with finance",
+            "requester": "CFO (sample)",
+            "due_date": "2026-12-01",
+            "email_subject": "Sample: Q1 renewal budgeting",
+        }
+    ],
+    "action_updates": [],
+    "significant_emails": [
+        {
+            "subject": "SAMPLE - Broker update on East Africa renewal talks",
+            "sender": "broker@example.com",
+            "summary": "Sample data: broker expects modest rate increases at January renewals.",
+            "why_it_matters": "Sample: plan your negotating position early.",
+        }
+    ],
+    "noise_count": 7,
+}
+
+SAMPLE_STRATEGIC = {
+    "strategic_summary": (
+        "This is a SAMPLE briefing generated without AI analysis, to verify delivery end to end. "
+        "In the live report, each section below is filled from your actual inbox and web research."
+    ),
+    "opportunities": [
+        {
+            "area": "SAMPLE - East Africa property",
+            "description": "Sample: rising rates create a window for quote-led growth.",
+            "rationale": "Sample data.",
+        }
+    ],
+    "risks": [
+        {
+            "description": "SAMPLE - Mauritius capital increase may strain cedent relationships.",
+            "urgency": "medium",
+        }
+    ],
+    "decision_matrix": [
+        {
+            "action": "SAMPLE - Review Mauritius capital change impact",
+            "category": "regulatory",
+            "impact": 4,
+            "urgency": 4,
+            "effort": 2,
+            "recommendation": "SAMPLE - Decide within a week",
+        }
+    ],
+}
+
+
+async def run(dry_run: bool, sample: bool = False) -> int:
+    now = datetime.now(UTC)
+
+    if sample:
+        from worker.workflows.daily_intel import (
+            CountryScan,
+            DecisionMatrixRow,
+            MarketItem,
+            NewAction,
+            Opportunity,
+            RegulatoryChange,
+            Risk,
+            SignificantEmail,
+        )
+
+        email_analysis = EmailAnalysis(
+            new_actions=[NewAction(**SAMPLE_EMAIL_ANALYSIS["new_actions"][0])],
+            significant_emails=[
+                SignificantEmail(**SAMPLE_EMAIL_ANALYSIS["significant_emails"][0])
+            ],
+            noise_count=SAMPLE_EMAIL_ANALYSIS["noise_count"],
+        )
+        market_scan = MarketScan(
+            kenya=CountryScan(
+                updates=[MarketItem(**SAMPLE_MARKET_SCAN["kenya"]["updates"][0])],
+                baseline_current="Sample baseline - unchanged.",
+            ),
+            tanzania=CountryScan(baseline_current="Sample baseline - unchanged."),
+            mauritius=CountryScan(
+                regulatory_changes=[
+                    RegulatoryChange(
+                        **SAMPLE_MARKET_SCAN["mauritius"]["regulatory_changes"][0]
+                    )
+                ],
+                baseline_current="Sample baseline - changed.",
+            ),
+        )
+        strategic = StrategicAnalysis(
+            strategic_summary=SAMPLE_STRATEGIC["strategic_summary"],
+            opportunities=[Opportunity(**SAMPLE_STRATEGIC["opportunities"][0])],
+            risks=[Risk(**SAMPLE_STRATEGIC["risks"][0])],
+            decision_matrix=[
+                DecisionMatrixRow(**SAMPLE_STRATEGIC["decision_matrix"][0])
+            ],
+        )
+        report = _compose_report(now, email_analysis, market_scan, strategic)
+        report = (
+            "> **Test delivery** - sample data, no AI analysis, nothing saved.\n\n"
+            + report
+        )
+        output = os.environ.get("REPORT_OUTPUT", "").strip()
+        if output:
+            Path(output).write_text(report, encoding="utf-8")
+        email_sent = await send_email(
+            subject=f"[TEST] Daily Executive Briefing - {now.date().isoformat()}",
+            body_text=report,
+        )
+        print(f"Done: sample report sent={email_sent}")
+        return 0
+
+    base_url, api_key = None, None
     if not os.environ.get("MISTRAL_API_KEY", "").strip():
         print("Missing required secret: MISTRAL_API_KEY")
         return 1
-
     base_url, api_key = _mistral_api_config()
     client = Mistral(api_key=api_key)
     now = datetime.now(UTC)
@@ -193,43 +366,52 @@ async def run(dry_run: bool) -> int:
 
     email_analysis: EmailAnalysis = (
         (
-            await client.chat.parse_async(
-                EmailAnalysis,
-                model=EMAIL_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{EMAIL_ANALYST_INSTRUCTIONS}\n\n"
-                            f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```\n\n"
-                            f"### Recent emails (since {since.isoformat()})\n```json\n{json.dumps(emails, indent=2)}\n```"
-                        ),
-                    }
-                ],
+            await with_retries(
+                lambda: client.chat.parse_async(
+                    EmailAnalysis,
+                    model=EMAIL_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{EMAIL_ANALYST_INSTRUCTIONS}\n\n"
+                                f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```\n\n"
+                                f"### Recent emails (since {since.isoformat()})\n```json\n{json.dumps(emails, indent=2)}\n```"
+                            ),
+                        }
+                    ],
+                ),
+                what="email analysis",
             )
         )
         .choices[0]
         .message.parsed
     )
 
-    agent = await client.beta.agents.create_async(
-        model=MARKET_MODEL,
-        name=f"reinsurance-market-analyst-{now.strftime('%Y%m%d%H%M%S')}",
-        instructions=MARKET_ANALYST_INSTRUCTIONS,
-        tools=[{"type": "web_search"}],
-        completion_args={"temperature": 0.2},
+    agent = await with_retries(
+        lambda: client.beta.agents.create_async(
+            model=MARKET_MODEL,
+            name=f"reinsurance-market-analyst-{now.strftime('%Y%m%d%H%M%S')}",
+            instructions=MARKET_ANALYST_INSTRUCTIONS,
+            tools=[{"type": "web_search"}],
+            completion_args={"temperature": 0.2},
+        ),
+        what="market agent",
     )
     try:
-        conversation = await client.beta.conversations.start_async(
-            agent_id=agent.id,
-            inputs=(
-                f"Today is {now.date().isoformat()}. Research since {since.date().isoformat()}. "
-                "Coverage countries: Kenya, Tanzania, Mauritius.\n\n"
-                f"### Current regulatory baselines\n```json\n{json.dumps(state.regulatory_baseline, indent=2)}\n```\n\n"
-                "### Already-reported events (do not repeat unless there is new development)\n"
-                f"```json\n{json.dumps(state.seen_events[-40:], indent=2)}\n```"
+        conversation = await with_retries(
+            lambda: client.beta.conversations.start_async(
+                agent_id=agent.id,
+                inputs=(
+                    f"Today is {now.date().isoformat()}. Research since {since.date().isoformat()}. "
+                    "Coverage countries: Kenya, Tanzania, Mauritius.\n\n"
+                    f"### Current regulatory baselines\n```json\n{json.dumps(state.regulatory_baseline, indent=2)}\n```\n\n"
+                    "### Already-reported events (do not repeat unless there is new development)\n"
+                    f"```json\n{json.dumps(state.seen_events[-40:], indent=2)}\n```"
+                ),
+                store=False,
             ),
-            store=False,
+            what="market research",
         )
     finally:
         try:
@@ -240,20 +422,23 @@ async def run(dry_run: bool) -> int:
 
     strategic: StrategicAnalysis = (
         (
-            await client.chat.parse_async(
-                StrategicAnalysis,
-                model=STRATEGY_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{STRATEGIST_INSTRUCTIONS}\n\n"
-                            f"### Email analysis\n```json\n{email_analysis.model_dump_json(indent=2)}\n```\n\n"
-                            f"### Market scan\n```json\n{market_scan.model_dump_json(indent=2)}\n```\n\n"
-                            f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```"
-                        ),
-                    }
-                ],
+            await with_retries(
+                lambda: client.chat.parse_async(
+                    StrategicAnalysis,
+                    model=STRATEGY_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{STRATEGIST_INSTRUCTIONS}\n\n"
+                                f"### Email analysis\n```json\n{email_analysis.model_dump_json(indent=2)}\n```\n\n"
+                                f"### Market scan\n```json\n{market_scan.model_dump_json(indent=2)}\n```\n\n"
+                                f"### Current open actions\n```json\n{json.dumps(state.open_actions, indent=2)}\n```"
+                            ),
+                        }
+                    ],
+                ),
+                what="strategic analysis",
             )
         )
         .choices[0]
@@ -294,8 +479,13 @@ def main() -> int:
         action="store_true",
         help="Analyse and persist state, but do not send the email.",
     )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Send a sample report with test data; no AI calls, nothing saved.",
+    )
     args = parser.parse_args()
-    return asyncio.run(run(args.dry_run))
+    return asyncio.run(run(args.dry_run, args.sample))
 
 
 if __name__ == "__main__":
